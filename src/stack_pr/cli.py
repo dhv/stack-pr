@@ -336,7 +336,7 @@ class StackEntry:
     def has_missing_info(self) -> bool:
         return None in (self._pr, self._head, self._base)
 
-    def pprint(self, *, links: bool) -> str:
+    def pprint(self, *, links: bool, is_synced: bool | None = None) -> str:
         s = b(self.commit.commit_id()[:8])
         pr_string = None
         pr_string = blue("#" + last(self.pr)) if self.has_pr() else red("no PR")
@@ -344,15 +344,11 @@ class StackEntry:
         if self._head or self._base:
             head_str = green(self._head) if self._head else red(str(self._head))
             base_str = green(self._base) if self._base else red(str(self._base))
-            branch_string = f"'{head_str}' -> '{base_str}'"
-        if pr_string or branch_string:
-            s += " ("
-        s += pr_string if pr_string else ""
-        if branch_string:
-            s += ", " if pr_string else ""
-            s += branch_string
-        if pr_string or branch_string:
-            s += ")"
+            branch_string = f"{head_str} → {base_str}"
+        sync_string = yellow("modified") if is_synced is False else None
+        parts = [p for p in (pr_string, branch_string, sync_string) if p]
+        if parts:
+            s += " (" + ", ".join(parts) + ")"
         s += ": " + self.commit.title()
 
         if links and self.has_pr():
@@ -407,6 +403,10 @@ def blue(s: str) -> str:
 
 def red(s: str) -> str:
     return ShellColors.FAIL + s + ShellColors.ENDC
+
+
+def yellow(s: str) -> str:
+    return ShellColors.WARNING + s + ShellColors.ENDC
 
 
 # https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda
@@ -557,10 +557,42 @@ def verify(st: list[StackEntry], *, check_base: bool = False) -> None:
             raise RuntimeError
 
 
-def print_stack(st: list[StackEntry], *, links: bool, level: int = 1) -> None:
-    log(b("Stack:"), level=level)
+def get_remote_head_shas(st: list[StackEntry], remote: str) -> dict[str, str]:
+    """Return a mapping of head branch name to its remote tracking SHA.
+
+    Branches with no corresponding remote ref are omitted.
+    """
+    head_refs = [
+        f"refs/remotes/{remote}/{e.head}" for e in st if e.has_head()
+    ]
+    if not head_refs:
+        return {}
+    out = get_command_output(
+        ["git", "for-each-ref", "--format=%(refname) %(objectname)", *head_refs]
+    )
+    prefix = f"refs/remotes/{remote}/"
+    result: dict[str, str] = {}
+    for line in out.splitlines():
+        ref, _, sha = line.partition(" ")
+        if ref.startswith(prefix) and sha:
+            result[ref[len(prefix) :]] = sha
+    return result
+
+
+def print_stack(
+    st: list[StackEntry],
+    *,
+    links: bool,
+    remote: str | None = None,
+    level: int = 1,
+) -> None:
+    remote_shas = get_remote_head_shas(st, remote) if remote else {}
     for e in reversed(st):
-        log("   * " + e.pprint(links=links), level=level)
+        is_synced: bool | None = None
+        if remote and e.has_pr() and e.has_head():
+            remote_sha = remote_shas.get(e.head)
+            is_synced = remote_sha == e.commit.commit_id()
+        log("* " + e.pprint(links=links, is_synced=is_synced), level=level)
 
 
 def draft_bitmask_type(value: str) -> list[bool]:
@@ -776,7 +808,7 @@ def generate_toc(st: list[StackEntry], current: str) -> str:
 
     def toc_entry(se: StackEntry) -> str:
         pr_id = last(se.pr)
-        arrow = "__->__" if pr_id == current else ""
+        arrow = "__→__" if pr_id == current else ""
         return f" * {arrow}#{pr_id}\n"
 
     entries = (toc_entry(se) for se in st[::-1])
@@ -1114,7 +1146,7 @@ def command_submit(
     verify(st)
 
     # Print stack now that PRs have been created
-    print_stack(st, links=args.hyperlinks)
+    print_stack(st, links=args.hyperlinks, remote=args.remote)
 
     # Embed stack-info into commit messages
     log(h("Updating commit messages with stack metadata"), level=2)
@@ -1285,7 +1317,7 @@ def command_land(args: CommonArgs) -> None:
     # already be there from the metadata that commits need to have by that
     # point.
     set_base_branches(st, args.target)
-    print_stack(st, links=args.hyperlinks)
+    print_stack(st, links=args.hyperlinks, remote=args.remote)
 
     # Verify that the stack is correct before trying to land it.
     verify(st, check_base=True)
@@ -1297,7 +1329,7 @@ def command_land(args: CommonArgs) -> None:
     if len(st) > 1:
         log(h("Rebasing the rest of the stack"), level=1)
         prs_to_rebase = st[1:]
-        print_stack(prs_to_rebase, links=args.hyperlinks, level=1)
+        print_stack(prs_to_rebase, links=args.hyperlinks, remote=args.remote, level=1)
         for e in prs_to_rebase:
             rebase_pr(e, remote=args.remote, target=args.target, verbose=args.verbose)
         # Change the target of the new bottom-most PR in the stack to 'target'
@@ -1390,7 +1422,7 @@ def command_abandon(args: CommonArgs) -> None:
         branch_name_template=args.branch_name_template,
     )
     set_base_branches(st, args.target)
-    print_stack(st, links=args.hyperlinks)
+    print_stack(st, links=args.hyperlinks, remote=args.remote)
 
     log(h("Stripping stack metadata from commit messages"))
 
@@ -1448,8 +1480,6 @@ def print_tips_after_view(st: list[StackEntry], args: CommonArgs) -> None:
 # Entry point for 'view' command
 # ===----------------------------------------------------------------------=== #
 def command_view(args: CommonArgs) -> None:
-    log(h("VIEW"))
-
     if should_update_local_base(
         head=args.head,
         base=args.base,
@@ -1482,9 +1512,8 @@ def command_view(args: CommonArgs) -> None:
         branch_name_template=args.branch_name_template,
     )
     set_base_branches(st, target=args.target)
-    print_stack(st, links=args.hyperlinks)
+    print_stack(st, links=args.hyperlinks, remote=args.remote)
     print_tips_after_view(st, args)
-    log(h(blue("SUCCESS!")))
 
 
 # ===----------------------------------------------------------------------=== #
