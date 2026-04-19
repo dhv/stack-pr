@@ -45,6 +45,7 @@ Repository = "https://github.com/modular/stack-pr"
 
 [project.scripts]
 stack-pr = "stack_pr.cli:main"
+spr = "stack_pr.cli:main"
 
 [build-system]
 requires = ["pdm-backend"]

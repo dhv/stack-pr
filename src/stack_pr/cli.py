@@ -68,7 +68,6 @@ from stack_pr.git import (
     check_gh_installed,
     get_current_branch_name,
     get_gh_username,
-    get_repo_root,
     get_uncommitted_changes,
     is_rebase_in_progress,
 )
@@ -108,7 +107,7 @@ RE_STACK_INFO_LINE = re.compile(
     r"\n^stack-info: PR: (.+), branch: (.+)\n?", re.MULTILINE
 )
 RE_PR_TOC = re.compile(
-    r"^Stacked PRs:\r?\n(^ \* (__->__)?#\d+\r?\n)*\r?\n", re.MULTILINE
+    r"^Stacked PRs:\r?\n(^ \* (__→__)?#\d+\r?\n)*\r?\n", re.MULTILINE
 )
 
 # Delimeter for PR body
@@ -710,11 +709,17 @@ def get_next_available_branch_name(branch_name_template: str, name: str) -> str:
 
 
 def set_head_branches(
-    st: list[StackEntry], remote: str, *, verbose: bool, branch_name_template: str
+    st: list[StackEntry],
+    remote: str,
+    *,
+    verbose: bool,
+    branch_name_template: str,
+    fetch: bool = True,
 ) -> None:
     """Set the head ref for each stack entry if it doesn't already have one."""
 
-    run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
+    if fetch:
+        run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
     available_name = get_available_branch_name(remote, branch_name_template)
     for e in filter(lambda e: not e.has_head(), st):
         e.head = available_name
@@ -921,7 +926,12 @@ def reset_remote_base_branches(
 # base (e.g. explicit hash of the commit) - but most probably nobody ever would
 # need that.
 def should_update_local_base(
-    head: str, base: str, remote: str, target: str, *, verbose: bool
+    head: str,
+    base: str,
+    remote: str,
+    target: str,
+    *,
+    verbose: bool,
 ) -> bool:
     base_hash = get_command_output(["git", "rev-parse", base])
     target_hash = get_command_output(["git", "rev-parse", f"{remote}/{target}"])
@@ -1479,7 +1489,11 @@ def print_tips_after_view(st: list[StackEntry], args: CommonArgs) -> None:
 # ===----------------------------------------------------------------------=== #
 # Entry point for 'view' command
 # ===----------------------------------------------------------------------=== #
-def command_view(args: CommonArgs) -> None:
+def command_view(
+    args: CommonArgs,
+    *,
+    fetch: bool,
+) -> None:
     if should_update_local_base(
         head=args.head,
         base=args.base,
@@ -1510,6 +1524,7 @@ def command_view(args: CommonArgs) -> None:
         remote=args.remote,
         verbose=args.verbose,
         branch_name_template=args.branch_name_template,
+        fetch=fetch,
     )
     set_base_branches(st, target=args.target)
     print_stack(st, links=args.hyperlinks, remote=args.remote)
@@ -1519,7 +1534,7 @@ def command_view(args: CommonArgs) -> None:
 # ===----------------------------------------------------------------------=== #
 # CONFIG
 # ===----------------------------------------------------------------------=== #
-def command_config(config_file: str, setting: str) -> None:
+def command_config(config_file: str | Path, setting: str) -> None:
     """Set a configuration value in the config file.
 
     Args:
@@ -1547,6 +1562,7 @@ def command_config(config_file: str, setting: str) -> None:
 
     config.set(section, key, value)
 
+    Path(config_file).parent.mkdir(parents=True, exist_ok=True)
     with Path(config_file).open("w") as f:
         config.write(f)
 
@@ -1606,9 +1622,8 @@ def create_argparser(
     )
 
     parser_submit = subparsers.add_parser(
-        "submit",
-        aliases=["export"],
-        help="Submit a stack of PRs",
+        "push",
+        help="Push a stack of PRs",
         parents=[common_parser],
     )
     parser_submit.add_argument(
@@ -1658,10 +1673,15 @@ def create_argparser(
         help="Abandon the current stack",
         parents=[common_parser],
     )
-    subparsers.add_parser(
+    view_parser = subparsers.add_parser(
         "view",
         help="Inspect the current stack",
         parents=[common_parser],
+    )
+    view_parser.add_argument(
+        "--fetch",
+        action="store_true",
+        default=False,
     )
 
     parser_config = subparsers.add_parser(
@@ -1684,21 +1704,19 @@ def load_config(config_file: str | Path) -> configparser.ConfigParser:
 
 
 def main() -> None:  # noqa: PLR0912
-    repo_config_file = get_repo_root() / ".stack-pr.cfg"
-    config_file = os.getenv("STACKPR_CONFIG", repo_config_file)
+    default_config_file = Path.home() / ".config" / "stack-pr" / "stack-pr.cfg"
+    config_file = os.getenv("STACKPR_CONFIG", default_config_file)
     config = load_config(config_file)
 
     parser = create_argparser(config)
-    args = parser.parse_args()
+
+    # Default to the 'view' subcommand when no args are given.
+    argv = sys.argv[1:] or ["view"]
+    args = parser.parse_args(argv)
 
     # Set global verbose flag (if present - config command doesn't have it)
     if hasattr(args, "verbose"):
         set_verbose(args.verbose)
-
-    if not args.command:
-        print(h(red("Invalid usage of the stack-pr command.")))
-        parser.print_help()
-        return
 
     # Handle config command early since it doesn't need git repo setup
     if args.command == "config":
@@ -1723,7 +1741,7 @@ def main() -> None:  # noqa: PLR0912
     get_branch_name_base(common_args.branch_name_template)
     stashed_changes = False
     try:
-        if args.command in ["submit", "export"] and args.stash:
+        if args.command == "push" and args.stash:
             result = run_shell_command(
                 ["git", "stash", "save"], quiet=not common_args.verbose
             )
@@ -1738,7 +1756,7 @@ def main() -> None:  # noqa: PLR0912
         check_target_branch_exists(common_args)
         common_args = deduce_base(common_args)
 
-        if args.command in ["submit", "export"]:
+        if args.command == "push":
             command_submit(
                 common_args,
                 draft=args.draft,
@@ -1751,7 +1769,7 @@ def main() -> None:  # noqa: PLR0912
         elif args.command == "abandon":
             command_abandon(common_args)
         elif args.command == "view":
-            command_view(common_args)
+            command_view(common_args, fetch=args.fetch)
         else:
             print(h(red("Unknown command: " + args.command)))
             return
